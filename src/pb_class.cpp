@@ -3363,6 +3363,8 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   int rank;
   MPI_Comm_rank (mpicomm, &rank);
 
+  std::cout << "[Rank " << rank << "] border_quad size: " << border_quad.size() << std::endl;
+
   if (rank == 0)
     std::cout << "\n================ [ Electrostatic Energy ] =================\n";
 

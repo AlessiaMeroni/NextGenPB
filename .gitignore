@@ -1,0 +1,9 @@
+# File compilati
+src/*.o
+src/ngpb
+
+# Configurazione locale (dipende dai path della macchina)
+src/local_settings.mk
+
+# Backup
+*.backup
