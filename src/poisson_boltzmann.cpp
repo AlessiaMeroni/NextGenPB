@@ -237,6 +237,16 @@ main (int argc, char **argv)
 
   TOC ("Compute numerical solution");
 
+  // Build the balanced border-quadrant data now that phi is available. 
+  // Only needed when energy_fast() is about to run.
+  if (! (pb.loc_refinement == 1
+         || pb.mesh_shape > 2
+         || (pb.mesh_shape == 2 && pb.refine_box == 1))){
+    TIC ();
+    pb.redistribute_border_quad ();
+    TOC ("Redistribute border quad")
+  }
+
   if (pb.atoms_write == 1) {
     TIC ();
     pb.write_potential_on_atoms_fast ();
