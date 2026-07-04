@@ -1936,6 +1936,58 @@ poisson_boltzmann::create_markers (ray_cache_t & ray_cache)
         } else if (num_int_nodes < (8 - num_hanging[2])) { //if the non hanging nodes are not all inside
           this->marker[quadrant->get_forest_quad_idx ()] = 1.0/2.0; //"border"
           border_quad.push_back (quadrant->get_forest_quad_idx ());
+          
+          // Stage a border-quadrant packet
+          // Runs only right after a quadrant has just been classified as "border".
+          // I grab here everything that is already available at this point in the
+          // program: geometry, and the surface-intersection fraction/normal for
+          // all 12 cube edges (these need ray_cache, which is only valid for this
+          // rank's own quadrants); phi and eps are not available/synchronized yet
+          // at this point (phi: linear system not solved yet; eps: epsilon_nodes
+          // is only ghost-synchronized later, when building the linear system) ->
+          // both will be fetched later, in redistribute_border_quad(), using the
+          // node indices saved here.
+          {
+            std::array<double,24> pkt_coords;  // (x,y,z) of the 8 nodes, flattened
+            std::array<int,8>     pkt_gnodes;  // global node indices, needed later to fetch eps/phi
+            std::array<double,3>  pkt_h;       // quadrant size along x, y, z
+            std::array<double,12> pkt_frac;    // intersection fraction, one per cube edge
+            std::array<double,36> pkt_normals; // intersection normal (3 comps), one per cube edge
+
+            for (int inode = 0; inode < 8; ++inode) {
+              int gnode = quadrant->gt (inode);          // global index of local node "inode"
+              pkt_gnodes[inode] = gnode;
+
+              pkt_coords[3*inode + 0] = quadrant->p (0, inode);
+              pkt_coords[3*inode + 1] = quadrant->p (1, inode);
+              pkt_coords[3*inode + 2] = quadrant->p (2, inode);
+            }
+
+            // Same h formula already used later in energy_fast.
+            for (int d = 0; d < 3; ++d)
+              pkt_h[d] = quadrant->p (d, 7) - quadrant->p (d, 0);
+
+            // Compute normal_intersection for all 12 cube edges, not just the ones
+            // that will turn out to be "crossed" by the surface (here ray_cache 
+            // still holds this rank's own ray-casting results for this quadrant). 
+            for (int edge = 0; edge < 12; ++edge) {
+              std::array<double,3> norm;
+              double frac;
+              this->normal_intersection (quadrant, ray_cache, edge, norm, frac);
+              pkt_frac[edge] = frac;
+              pkt_normals[3*edge + 0] = norm[0];
+              pkt_normals[3*edge + 1] = norm[1];
+              pkt_normals[3*edge + 2] = norm[2];
+            }
+
+            // Global position is only known after redistribute_border_quad();
+            // for now, just stash the packet locally.
+            bq_local_gnodes.push_back (pkt_gnodes);
+            bq_local_coords.push_back (pkt_coords);
+            bq_local_h.push_back (pkt_h);
+            bq_local_frac.push_back (pkt_frac);
+            bq_local_normals.push_back (pkt_normals);
+          }
         }
 
         //else: all the nodes are inside: the quadrant is inside and the marker value is 0
@@ -1954,6 +2006,97 @@ poisson_boltzmann::create_markers (ray_cache_t & ray_cache)
     MPI_Barrier (mpicomm);
     ray_cache.fill_cache ();
   }
+}
+
+
+void
+poisson_boltzmann::redistribute_border_quad ()
+{
+  int rank, size;
+  MPI_Comm_rank (mpicomm, &rank);
+  MPI_Comm_size (mpicomm, &size);
+
+  // How many border quadrants this rank finds during marking
+  const int n_local = static_cast<int> (bq_local_gnodes.size ());
+
+  // Learn how many border quadrants every other rank found too.
+  // This is a single int per rank, not the actual packet data (cheap communication).
+  std::vector<int> counts (size, 0);
+  MPI_Allgather (&n_local, 1, MPI_INT, counts.data (), 1, MPI_INT, mpicomm);
+
+  // Turn the per-rank counts into:
+  //  - N_tot: total number of border quadrants in the whole system
+  //  - local_offset: where this rank's quadrants start in a global
+  //    numbering that lists rank 0's quadrants first, then rank 1's,
+  //    and so on (a prefix sum over "counts").
+  int N_tot = 0;
+  int local_offset = 0;
+  for (int r = 0; r < size; ++r) {
+    if (r < rank) local_offset += counts[r];
+    N_tot += counts[r];
+  }
+
+  // Decide how many packets this rank should own after balancing.
+  // N_tot packets split as evenly as possible among "size" ranks:
+  // the first "rem" ranks get one extra packet to absorb the remainder.
+  const int base = N_tot / size;
+  const int rem  = N_tot % size;
+  bq_local_target_count = base + (rank < rem ? 1 : 0);
+
+  // Build the flattened distributed_vector: this rank asks to own
+  // BQ_PACKET_SIZE * bq_local_target_count doubles. distributed_vector's
+  // constructor takes care of turning this into a consistent global
+  // numbering across all ranks (see bim_distributed_vector.cpp).
+  border_quad_distributed =
+    std::make_unique<distributed_vector> (BQ_PACKET_SIZE * bq_local_target_count, mpicomm);
+
+  // Write every locally-buffered packet into its global slot.
+  // "k" is this quadrant's position in the (source) global numbering.
+  for (int i = 0; i < n_local; ++i) {
+    const int k = local_offset + i;
+    const int base_idx = BQ_PACKET_SIZE * k;
+
+    // phi was not available during create_markers: fetch it now,
+    // using the global node indices saved back then.
+    for (int inode = 0; inode < 8; ++inode)
+      (*border_quad_distributed) (base_idx + inode) = (*phi)[bq_local_gnodes[i][inode]];
+
+    // eps was not synchronized across ranks yet during create_markers
+    // (bim3a_solution_with_ghosts on epsilon_nodes only happens later, when
+    // building the linear system): fetch it now, exactly like phi, using
+    // the same global node indices saved back then.
+    for (int inode = 0; inode < 8; ++inode)
+      (*border_quad_distributed) (base_idx + 8 + inode) = (*epsilon_nodes)[bq_local_gnodes[i][inode]];
+
+    // coords and h were already computed in create_markers: just copy them
+    // into their slots.
+    for (int c = 0; c < 24; ++c)
+      (*border_quad_distributed) (base_idx + 16 + c) = bq_local_coords[i][c];
+
+    for (int d = 0; d < 3; ++d)
+      (*border_quad_distributed) (base_idx + 40 + d) = bq_local_h[i][d];
+
+    // frac and normal were also already computed in create_markers
+    // (they needed this rank's own ray_cache, valid only there): copy
+    // them into their slots too, one fraction and one normal per edge.
+    for (int e = 0; e < 12; ++e)                                                     
+      (*border_quad_distributed) (base_idx + 43 + e) = bq_local_frac[i][e];          
+
+    for (int c = 0; c < 36; ++c)                                                    
+      (*border_quad_distributed) (base_idx + 55 + c) = bq_local_normals[i][c];
+  }
+
+  // A single communication step that finalizes the balanced layout:
+  // internally figures out who owns what and moves the data there.
+  border_quad_distributed->assemble ();
+
+  // The staging buffers are no longer needed: release their memory.
+  // swap-with-empty: clear() alone would not shrink the capacity.
+  std::vector<std::array<int,8>> ().swap (bq_local_gnodes);
+  std::vector<std::array<double,24>> ().swap (bq_local_coords);
+  std::vector<std::array<double,3>> ().swap (bq_local_h);
+  std::vector<std::array<double,12>> ().swap (bq_local_frac); 
+  std::vector<std::array<double,36>> ().swap (bq_local_normals);
 }
 
 
@@ -3357,6 +3500,7 @@ poisson_boltzmann::energy (ray_cache_t & ray_cache)
   }
 }
 
+/*
 void
 poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
 {
@@ -3625,6 +3769,413 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
     // << "    Error w.r.t. net charge [%]:"
     // << std::setprecision(6)
     // << ((charge_pol / (4.0 * pi) - net_charge) / net_charge * 100.0) << "\n";
+
+    std::cout << std::left << std::setw (label_width) << "  Polarization energy [kT]:"
+              << std::setprecision (precision) << energy_pol << "\n";
+
+    if (calc_energy == 2) {
+      std::cout << std::left << std::setw (label_width) << "  Direct ionic energy [kT]:"
+                << std::setprecision (precision) << energy_react << "\n";
+    }
+
+    if (calc_coulombic == 1) {
+      std::cout << std::left << std::setw (label_width) << "  Coulombic energy [kT]:"
+                << std::setprecision (precision) << coul_energy << "\n";
+    }
+
+    std::cout << std::left << std::setw (label_width) << "  Sum of electrostatic energy contributions [kT]:"
+              << std::setprecision (precision)
+              << (energy_pol + energy_react + coul_energy) << "\n";
+
+    std::cout << "===========================================================\n";
+  }
+}
+*/
+
+void
+poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
+{
+  int rank;
+  MPI_Comm_rank (mpicomm, &rank);
+
+  // Diagnostic print: "as-found" count is how many border quadrants this
+  // rank found during marking (the old, unbalanced number, still in
+  // border_quad); "balanced packets" is how many packets this rank now
+  // owns after redistribute_border_quad() -- the number the loops below
+  // actually iterate on. Comparing the two, across ranks, is how we will
+  // check that the redistribution really balances the workload.
+  std::cout << "[Rank " << rank << "] border_quad size (as-found): "
+            << border_quad.size () << ", balanced packets: "
+            << bq_local_target_count << std::endl;
+
+  if (rank == 0)
+    std::cout << "\n================ [ Electrostatic Energy ] =================\n";
+
+  // Same physical constants as the original function, unchanged.
+  double eps_in = 4.0*pi*e_0*e_in*kb*T*Angs/ (e*e);
+  double eps_out = 4.0*pi*e_0*e_out*kb*T*Angs/ (e*e);
+  double C_0 = 1.0e3*N_av*ionic_strength;
+  double k2 = 2.0*C_0*Angs*Angs*e*e/ (e_0*e_out*kb*T);
+  double k = std::sqrt (k2);
+
+  // ------------------------------------------------------------------
+  // Coulomb energy: does not involve border_quad at all (it is a direct
+  // sum over pairs of atoms), so this part is completely unchanged from
+  // the original energy_fast.
+  // ------------------------------------------------------------------
+  std::vector<double> charge_atoms_tmp;
+  std::vector<std::array<double,3>> pos_atoms_tmp;
+
+  for (int ii = 0; ii < charge_atoms.size (); ++ii) {
+    if (std::fabs (charge_atoms[ii]) > 1.e-5) {
+      charge_atoms_tmp.push_back (std::move (charge_atoms[ii]));
+      pos_atoms_tmp.push_back (std::move (pos_atoms[ii]));
+    }
+  }
+
+  double energy_pol = 0.0;
+  double energy_react = 0.0;
+  double coul_energy = 0.0;
+  double dx, dy, dz;
+  double distance = 0.0;
+  const size_t num_atoms = charge_atoms_tmp.size();
+
+  std::vector<double> ().swap (charge_atoms);
+  std::vector<std::array<double,3>> ().swap (pos_atoms);
+
+  if (calc_coulombic == 1) {
+    const double den_in = 1.0 / eps_in;
+
+    for (size_t i = 0; i < num_atoms; ++i) {
+      const double qi = charge_atoms_tmp[i];
+      const double xi = pos_atoms_tmp[i][0];
+      const double yi = pos_atoms_tmp[i][1];
+      const double zi = pos_atoms_tmp[i][2];
+
+      for (size_t j = i + 1; j < num_atoms; ++j) {
+        dx = xi - pos_atoms_tmp[j][0];
+        dy = yi - pos_atoms_tmp[j][1];
+        dz = zi - pos_atoms_tmp[j][2];
+        distance = std::sqrt (dx * dx + dy * dy + dz * dz);
+        coul_energy += (qi * charge_atoms_tmp[j]) / distance;
+      }
+    }
+
+    coul_energy *= den_in;
+  }
+
+  ////////////////////////////////////////////////////////
+
+  // Working variables for the border-quadrant part of the calculation.
+  // Same names/roles as in the original energy_fast; the only structural
+  // difference is where their values come from (the packet, not the mesh).
+  double fract;
+  std::array<double,3> V;             // a point on a cube edge/triangle vertex
+  std::array<double,3> h;             // quadrant size (x,y,z), same for every
+                                       // border quadrant in this mesh type
+  std::array<double,3> area_h;        // derived from h, used as a flux weight
+  std::array<double,3> dist_vert;
+
+  std::array<double,8>  tmp_eps;      // eps on the 8 nodes of the CURRENT packet
+  std::array<double,8>  tmp_phi;      // phi on the 8 nodes of the CURRENT packet
+  std::array<double,24> pkt_coords;   // (x,y,z) of the 8 nodes, flattened
+  std::array<double,12> pkt_frac;     // intersection fraction, one per cube edge
+  std::array<double,36> pkt_normal;   // intersection normal (3 comps), one per edge
+  std::vector<int> edg;               // edges actually crossed by the surface
+  std::vector<int> fl_dir;            // flux direction (+1/-1) for each edge in "edg"
+
+  int cubeindex = -1;
+  double charge_pol = 0.0;
+
+  const double constant_pol = 0.5* (1.0/eps_out - 1.0/eps_in)/ (4.0*pi);
+  const double constant_react = 1.0/ (8*pi*eps_out);
+  const double inv_4pi = 1.0 / (4.0 * pi);
+  double product = 0.0;
+  double first_int = 0.0;
+  double second_int = 0.0;
+  double tmp_flux;
+  int i1 = 0, i2 = 0;
+  double tmp_phi_1 = 0.0, tmp_phi_2 = 0.0,
+         tmp_eps_1 = 0.0, tmp_eps_2 = 0.0;
+
+  int ntriang = 0;
+  int edge;
+  std::array<std::array<double,3>,3> vert_triangles;
+  std::array<std::array<double,3>,3> norms_vert;
+  std::array<double,3> phi_sup;
+  double area = 0.0;
+  double d2;
+
+  // This is the key structural change: instead of iterating on border_quad
+  // and reaching into tmsh/phi/epsilon_nodes through a quadrant iterator,
+  // we iterate on this rank's own slice of the balanced, flattened vector
+  // built earlier by redistribute_border_quad(). get_owned_data() returns
+  // a plain std::vector<double> of size BQ_PACKET_SIZE * bq_local_target_count.
+  std::vector<double> &owned = border_quad_distributed->get_owned_data ();
+
+  // ------------------------------------------------------------------
+  // h / area_h: computed ONCE, from the first local packet, exactly like
+  // the original code did using quadrant[border_quad[0]]. This relies on
+  // every border quadrant having the same size h in this mesh type (true
+  // for the "derefined" mesh used here) -- so there is no need to redo
+  // this calculation inside the loop below.
+  // ------------------------------------------------------------------
+  if (bq_local_target_count > 0) {
+    for (int d = 0; d < 3; ++d)
+      h[d] = owned[40 + d];   // packet 0 starts at index 0, so its "h" slot
+                               // is simply at offset 40 (see BQ_PACKET_SIZE layout)
+
+    area_h[0] = h[1]*h[2]/h[0] * 0.25;
+    area_h[1] = h[0]*h[2]/h[1] * 0.25;
+    area_h[2] = h[0]*h[1]/h[2] * 0.25;
+  }
+
+  // Load packet p (local index, 0 .. bq_local_target_count-1) into the
+  // working arrays above. This replaces reading phi/eps/coordinates from
+  // quadrant->gt(ii)/quadrant->p(dim,ii), and frac/normal from a fresh
+  // call to normal_intersection() (which, remember, would not even work
+  // correctly here -- see SESSIONE 17 -- because this rank's ray_cache
+  // does not necessarily hold the data for a quadrant redistributed from
+  // another rank). h/area_h are NOT reloaded here on purpose (see above).
+  auto load_packet = [&] (int p) {
+    const int base_idx = BQ_PACKET_SIZE * p;
+
+    for (int inode = 0; inode < 8; ++inode) {
+      tmp_phi[inode] = owned[base_idx + inode];
+      tmp_eps[inode] = owned[base_idx + 8 + inode];
+    }
+    for (int c = 0; c < 24; ++c)
+      pkt_coords[c] = owned[base_idx + 16 + c];
+    for (int e = 0; e < 12; ++e)
+      pkt_frac[e] = owned[base_idx + 43 + e];
+    for (int c = 0; c < 36; ++c)
+      pkt_normal[c] = owned[base_idx + 55 + c];
+  };
+
+  // Same edge/flux classification the original classifyCube_flux_fast
+  // performs: for each of the 12 cube edges, compare eps on its two
+  // endpoints to decide whether the surface crosses it, and in which
+  // direction the flux goes. The only difference from the original is
+  // that eps comes from the packet array (tmp_eps) instead of being
+  // read live via quadrant->gt(ii) -- the comparisons themselves, and
+  // the edge2nodes lookup table, are identical to the original code.
+  auto classify_flux = [&] () {
+    edg.clear ();
+    fl_dir.clear ();
+    for (int ii = 0; ii < 12; ++ii) {
+      if (tmp_eps[edge2nodes[2*ii]] < tmp_eps[edge2nodes[2*ii + 1]]) {
+        fl_dir.push_back (1);
+        edg.push_back (ii);
+      } else if (tmp_eps[edge2nodes[2*ii]] > tmp_eps[edge2nodes[2*ii + 1]]) {
+        fl_dir.push_back (-1);
+        edg.push_back (ii);
+      }
+    }
+  };
+
+  // Same cube classification the original classifyCube_fast performs
+  // (the Marching Cubes "which corners are inside/outside" index, used
+  // to look up which triangles approximate the surface inside this
+  // cube). Note the traversal order {0,1,3,2,4,5,7,6}: this is the
+  // standard Marching-Cubes corner order, different from the plain
+  // mesh-node order 0..7 -- copied unchanged from the original function.
+  auto classify_cube = [&] (double isolevel) {
+    int cindex = 0, index = 1;
+    constexpr double EPSILON = 1e-10;
+    for (int ii : {0,1,3,2,4,5,7,6}) {
+      if (tmp_eps[ii] < (isolevel - EPSILON)) cindex |= index;
+      index *= 2;
+    }
+    if (edgeTable[cindex] == 0) return -1;
+    return cindex;
+  };
+
+  // Same role as quadrant->p(dim, inode) in the original code: returns
+  // the "dim" coordinate (0=x, 1=y, 2=z) of local node "inode", but
+  // reading it from the flattened packet array instead of the mesh.
+  auto node_p = [&] (int dim, int inode) {
+    return pkt_coords[3*inode + dim];
+  };
+
+  // ------------------------------------------------------------------
+  // Component 1: polarization energy only (used when calc_energy==1, or
+  // when calc_energy==2 but the ionic strength k is essentially zero).
+  // Structurally identical to the original loop over border_quad: for
+  // every border quadrant, for every edge actually crossed by the
+  // surface, accumulate the flux contribution and, for every atom, its
+  // energy contribution.
+  // ------------------------------------------------------------------
+  if (calc_energy==1 || (calc_energy == 2 && k < 1.e-5)) {
+    for (int p = 0; p < bq_local_target_count; ++p) {
+      load_packet (p);
+      classify_flux ();
+
+      for (int ip = 0; ip < edg.size (); ++ip) {
+        tmp_flux = 0.0;
+        edge = edg[ip];
+        i1 = edge2nodes[2 * edge];
+        i2 = edge2nodes[2 * edge + 1];
+
+        // fract used to come from normal_intersection(quadrant, ray_cache, ...);
+        // it is now simply looked up in the packet, already computed in
+        // create_markers() while this rank's own ray_cache was still valid.
+        fract = pkt_frac[edge];
+
+        V[0] = node_p (0, i1);
+        V[1] = node_p (1, i1);
+        V[2] = node_p (2, i1);
+        V[edge_axis[edge]] += fract*h[edge_axis[edge]];
+
+        tmp_flux = - (tmp_phi[i2] - tmp_phi[i1]) * wha (tmp_eps[i1],tmp_eps[i2], fract)*
+                   fl_dir[ip] * area_h[edge_axis[edge]];
+        charge_pol += tmp_flux;
+
+        for (int iatom = 0; iatom < num_atoms; ++iatom) {
+          dx = pos_atoms_tmp[iatom][0] - V[0];
+          dy = pos_atoms_tmp[iatom][1] - V[1];
+          dz = pos_atoms_tmp[iatom][2] - V[2];
+          distance = std::sqrt (dx * dx + dy * dy + dz * dz);
+          first_int += charge_atoms_tmp[iatom]*tmp_flux/distance;
+        }
+      }
+    }
+
+    energy_pol = constant_pol*first_int;
+  }
+
+  // ------------------------------------------------------------------
+  // Component 2: polarization + ionic energy (used when calc_energy==2
+  // and the ionic strength k is non-negligible). Adds, on top of the
+  // same flux loop as above, a loop over the surface triangles inside
+  // each border quadrant, needed for the ionic-energy surface integral.
+  // ------------------------------------------------------------------
+  if (calc_energy==2 && k > 1.e-5) {
+    for (int p = 0; p < bq_local_target_count; ++p) {
+      load_packet (p);
+      cubeindex = classify_cube (eps_out);
+      classify_flux ();
+
+      // getTriangles is completely unchanged: it only needs cubeindex
+      // (an int) and the static triTable, nothing mesh-related.
+      ntriang = getTriangles (cubeindex, triangles);
+
+      // -- flux part (same structure as Component 1 above) --
+      for (int ip = 0; ip < edg.size (); ++ip) {
+        tmp_flux = 0.0;
+        edge = edg[ip];
+        i1 = edge2nodes[2 * edge];
+        i2 = edge2nodes[2 * edge + 1];
+        tmp_phi_1 = tmp_phi[i1];
+        tmp_phi_2 = tmp_phi[i2];
+        tmp_eps_1 = tmp_eps[i1];
+        tmp_eps_2 = tmp_eps[i2];
+        fract = pkt_frac[edge];
+
+        V[0] = node_p (0, i1);
+        V[1] = node_p (1, i1);
+        V[2] = node_p (2, i1);
+        V[edge_axis[edge]] += fract*h[edge_axis[edge]];
+
+        tmp_flux = - (tmp_phi_2 - tmp_phi_1) * wha (tmp_eps_1,tmp_eps_2, fract)*
+                   fl_dir[ip] * area_h[edge_axis[edge]];
+        charge_pol += tmp_flux;
+
+        for (int ii = 0; ii < num_atoms; ++ii) {
+          dx = pos_atoms_tmp[ii][0] - V[0];
+          dy = pos_atoms_tmp[ii][1] - V[1];
+          dz = pos_atoms_tmp[ii][2] - V[2];
+          distance = std::sqrt (dx * dx + dy * dy + dz * dz);
+          first_int += charge_atoms_tmp[ii]*tmp_flux/distance;
+        }
+      }
+
+      // -- triangle (surface integral) part --
+      for (int itri = 0; itri < ntriang; ++itri) {
+        for (int jj = 0; jj < 3; ++jj) {
+          // triangles[itri][jj] is a cube-edge index (0..11), same
+          // numbering space as edg/edge2nodes/pkt_frac/pkt_normal above,
+          // so we can look it up directly in the packet.
+          edge = triangles[itri][jj];
+          i1 = edge2nodes[2 * edge];
+          i2 = edge2nodes[2 * edge + 1];
+
+          V[0] = node_p (0, i1);
+          V[1] = node_p (1, i1);
+          V[2] = node_p (2, i1);
+
+          fract = pkt_frac[edge];
+          V[edge_axis[edge]] += fract*h[edge_axis[edge]];
+          vert_triangles[jj] = V;
+
+          // The surface normal used to come straight from
+          // normal_intersection(); now it is the value already computed
+          // for this edge in create_markers() and copied into the packet.
+          norms_vert[jj][0] = pkt_normal[3*edge + 0];
+          norms_vert[jj][1] = pkt_normal[3*edge + 1];
+          norms_vert[jj][2] = pkt_normal[3*edge + 2];
+
+          tmp_phi_1 = tmp_phi[i1];
+          tmp_phi_2 = tmp_phi[i2];
+          tmp_eps_1 = tmp_eps[i1];
+          tmp_eps_2 = tmp_eps[i2];
+
+          phi_sup[jj]= phi0 (tmp_eps_1, tmp_eps_2, tmp_phi_1, tmp_phi_2, fract);
+        }
+
+        area = areaTriangle (vert_triangles);
+
+        for (int iatom = 0; iatom < num_atoms; ++iatom) {
+          const double qi = charge_atoms_tmp[iatom];
+          const double xi = pos_atoms_tmp[iatom][0];
+          const double yi = pos_atoms_tmp[iatom][1];
+          const double zi = pos_atoms_tmp[iatom][2];
+
+          for (int kk = 0; kk < 3; ++kk) {
+            dist_vert[0] = vert_triangles[kk][0]- xi;
+            dist_vert[1] = vert_triangles[kk][1]- yi;
+            dist_vert[2] = vert_triangles[kk][2]- zi;
+            d2 = dist_vert[0] * dist_vert[0] +
+                 dist_vert[1] * dist_vert[1] +
+                 dist_vert[2] * dist_vert[2];
+            distance = std::sqrt (d2);
+            product = dist_vert[0]*norms_vert[kk][0] +
+                      dist_vert[1]*norms_vert[kk][1] +
+                      dist_vert[2]*norms_vert[kk][2];
+            second_int += qi*phi_sup[kk]*product/ (distance*distance*distance)* inv_4pi *area/3;
+          }
+        }
+      }
+    }
+
+    energy_pol = constant_pol*first_int;
+    energy_react = 0.5*second_int - first_int*constant_react;
+  }
+
+  // ------------------------------------------------------------------
+  // Reduction and printing: completely unchanged from the original.
+  // Every rank has, at this point, computed its own local contribution
+  // to charge_pol/energy_pol/energy_react (having processed its own
+  // balanced share of packets); this sums them all onto rank 0.
+  // ------------------------------------------------------------------
+  if (rank == 0) {
+    MPI_Reduce (MPI_IN_PLACE, &charge_pol, 1, MPI_DOUBLE, MPI_SUM, 0, mpicomm);
+    MPI_Reduce (MPI_IN_PLACE, &energy_pol, 1, MPI_DOUBLE, MPI_SUM, 0, mpicomm);
+    MPI_Reduce (MPI_IN_PLACE, &energy_react, 1, MPI_DOUBLE, MPI_SUM, 0, mpicomm);
+  } else {
+    MPI_Reduce (&charge_pol, &charge_pol, 1, MPI_DOUBLE, MPI_SUM, 0, mpicomm);
+    MPI_Reduce (&energy_pol, &energy_pol, 1, MPI_DOUBLE, MPI_SUM, 0, mpicomm);
+    MPI_Reduce (&energy_react, &energy_react, 1, MPI_DOUBLE, MPI_SUM, 0, mpicomm);
+  }
+
+  if (rank == 0) {
+    constexpr int label_width = 50;
+    constexpr int precision = 16;
+
+    std::cout << std::left << std::setw (label_width) << "  Net charge [e]:"
+              << std::setprecision (precision) << net_charge << "\n";
+
+    std::cout << std::left << std::setw (label_width) << "  Flux charge [e]:"
+              << std::setprecision (precision) << charge_pol / (4.0 * pi) << "\n";
 
     std::cout << std::left << std::setw (label_width) << "  Polarization energy [kT]:"
               << std::setprecision (precision) << energy_pol << "\n";
