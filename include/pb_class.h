@@ -166,6 +166,47 @@ struct
 
   std::vector<int> border_quad;
 
+  //  Balanced redistribution of border_quad
+  
+  // Packet layout (offsets relative to 91*k, k = global border-quadrant index):
+  //   [ 0 .. 7]  phi     (potential on the 8 nodes)
+  //   [ 8 ..15]  eps     (dielectric constant on the 8 nodes)
+  //   [16 ..39]  coords  (x,y,z of the 8 nodes, flattened)
+  //   [40 ..42]  h       (quadrant size along x,y,z)
+  //   [43 ..54]  frac    (surface-intersection fraction, one per cube edge, 12 edges)
+  //   [55 ..90]  normal  (surface normal, 3 components per edge, 12 edges)
+  // distributed_vector only stores doubles, so each border quadrant is
+  // "flattened" into BQ_PACKET_SIZE consecutive global indices. Since
+  // distributed_vector always assigns contiguous index blocks to ranks,
+  // an owned_count that is a multiple of BQ_PACKET_SIZE guarantees that a
+  // packet is never split between two ranks.
+  static constexpr int BQ_PACKET_SIZE = 91;  // 8+8+24+3+12+36
+
+  // Local staging buffers, filled inside create_markers() when a quadrant
+  // is classified as "border". coords/h/frac/normal are all available at
+  // marking time (frac/normal need ray_cache); phi and eps are not yet
+  // available/synchronized at this point (phi: linear system not solved
+  // yet; eps: epsilon_nodes is only ghost-synchronized later, when
+  // building the linear system) -> both are fetched later, in
+  // redistribute_border_quad(), using the node indices saved here.
+  std::vector<std::array<double,24>> bq_local_coords;
+  std::vector<std::array<double,3>>  bq_local_h;
+  std::vector<std::array<double,12>> bq_local_frac;     // one fraction per cube edge
+  std::vector<std::array<double,36>> bq_local_normals;  // one normal (3 comps) per cube edge
+  std::vector<std::array<int,8>>     bq_local_gnodes;   // global node indices (for eps/phi later)
+
+  // Balanced, flattened representation of all border-quadrant packets,
+  // built by redistribute_border_quad() after the linear system is solved.
+  std::unique_ptr<distributed_vector> border_quad_distributed;
+
+  // Number of packets (border quadrants) owned by this rank after the
+  // balanced redistribution (set inside redistribute_border_quad()).
+  int bq_local_target_count = 0;
+
+  // Build the balanced, flattened distributed_vector of border-quadrant packets.
+  // Must be called exactly once, after the linear system has been
+  // solved (phi available) and before energy_fast(). 
+  void redistribute_border_quad();
 
   std::set<std::array<int, 2>> int_nodes;
 
