@@ -166,6 +166,9 @@ struct
 
   std::vector<int> border_quad;
 
+/*
+STRATEGIA VECCHIA OK
+
   //  Balanced redistribution of border_quad
   
   // Packet layout (offsets relative to 91*k, k = global border-quadrant index):
@@ -207,6 +210,75 @@ struct
   // Must be called exactly once, after the linear system has been
   // solved (phi available) and before energy_fast(). 
   void redistribute_border_quad();
+
+*/
+
+  // ============================================================================
+  //  Strategia vecchia: balanced redistribution of border_quad
+  //
+  //  The previous packet layout (91 values, phi+eps embedded) is kept below 
+  //  as a comment for quick rollback if the new strategy turns out to perform worse; 
+  //  the corresponding function bodies (redistribute_border_quad(), energy_fast()) will be
+  //  commented out the same way, in their own files, once we get there.
+  //
+  //  OLD packet layout (BQ_PACKET_SIZE = 91):
+  //    [ 0 .. 7]  phi     (potential on the 8 nodes)
+  //    [ 8 ..15]  eps     (dielectric constant on the 8 nodes)
+  //    [16 ..39]  coords  (x,y,z of the 8 nodes, flattened)
+  //    [40 ..42]  h       (quadrant size along x,y,z)
+  //    [43 ..54]  frac    (surface-intersection fraction, one per cube edge)
+  //    [55 ..90]  normal  (surface normal, 3 components per edge)
+  //
+  //  NEW packet layout (BQ_PACKET_SIZE = 83):
+  //    [ 0 .. 7]  gnodes  (global node indices, 8 values -- replaces phi+eps)
+  //    [ 8 ..31]  coords  (x,y,z of the 8 nodes, flattened)
+  //    [32 ..34]  h       (quadrant size along x,y,z)
+  //    [35 ..46]  frac    (surface-intersection fraction, one per cube edge)
+  //    [47 ..82]  normal  (surface normal, 3 components per edge)
+  //
+  //  distributed_vector only stores doubles, so each border quadrant is
+  //  "flattened" into BQ_PACKET_SIZE consecutive global indices. Since
+  //  distributed_vector always assigns contiguous index blocks to ranks,
+  //  an owned_count that is a multiple of BQ_PACKET_SIZE guarantees that a
+  //  packet is never split between two ranks.
+  // ============================================================================
+  static constexpr int BQ_PACKET_SIZE = 83;  // 8 gnodes + 24 coords + 3 h + 12 frac + 36 normal
+
+  // Local staging buffers, filled inside create_markers() when a quadrant
+  // is classified as "border". All are available at marking time
+  // (frac/normal need ray_cache, valid only for this rank's own quadrant
+  // at this moment). phi and eps are not staged here any more: only the global 
+  // node indices are kept; phi/eps are fetched later BY INDEX, in redistribute_border_quad(), 
+  // via the new index-based remote-read block.
+  std::vector<std::array<double,24>> bq_local_coords;
+  std::vector<std::array<double,3>>  bq_local_h;
+  std::vector<std::array<double,12>> bq_local_frac;     // one fraction per cube edge
+  std::vector<std::array<double,36>> bq_local_normals;  // one normal (3 comps) per cube edge
+  std::vector<std::array<int,8>>     bq_local_gnodes;   // global node indices (now part of the packet itself)
+
+  // Balanced, flattened representation of all border-quadrant packets,
+  // built by redistribute_border_quad() after the linear system is solved.
+  std::unique_ptr<distributed_vector> border_quad_distributed;
+
+  // Number of packets (border quadrants) owned by this rank after the
+  // balanced redistribution (set inside redistribute_border_quad()).
+  int bq_local_target_count = 0;
+
+  // Per-packet phi/eps values, fetched by global node index AFTER
+  // border_quad_distributed->assemble() (Strategia C-bis, Part 3).
+  // Layout: bq_phi_owned[8*p + inode] is phi at packet p's inode-th node
+  // (same indexing convention used by tmp_phi/tmp_eps in energy_fast).
+  std::vector<double> bq_phi_owned;
+  std::vector<double> bq_eps_owned;
+
+  // Build the balanced, flattened distributed_vector of border-quadrant
+  // packets, then fetch phi/eps by global node index for each owned packet.
+  // Must be called exactly once, after the linear system has been
+  // solved (phi available) and before energy_fast().
+  void redistribute_border_quad();
+
+
+
 
   std::set<std::array<int, 2>> int_nodes;
 
