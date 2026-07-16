@@ -832,6 +832,33 @@ poisson_boltzmann::parse_options (int argc, char **argv)
   if (rank == 0)
     std::cout << "Selected parameters file: " << optionsfilename << std::endl;
 
+  // =============================
+  // Strategy selection: --strategy unbalanced|balanced_embedded|balanced_indexed
+  // Defaults to balanced_indexed (the current, most optimized implementation)
+  // if the option is not given, so existing scripts/commands keep working
+  // unchanged.
+  // =============================
+  strategy = border_quad_strategy::balanced_indexed;
+  std::string strategy_name = "balanced_indexed";
+  if (g.search ("--strategy")) {
+    strategy_name = g.next ("balanced_indexed");
+    if (strategy_name == "unbalanced")
+      strategy = border_quad_strategy::unbalanced;
+    else if (strategy_name == "balanced_embedded")
+      strategy = border_quad_strategy::balanced_embedded;
+    else if (strategy_name == "balanced_indexed")
+      strategy = border_quad_strategy::balanced_indexed;
+    else {
+      if (rank == 0)
+        std::cerr << "Warning: unknown --strategy value '" << strategy_name
+                  << "', expected unbalanced, balanced_embedded, or balanced_indexed. "
+                  << "Using default (balanced_indexed).\n";
+      strategy_name = "balanced_indexed";
+    }
+  }
+  if (rank == 0)
+    std::cout << "Selected border_quad strategy: " << strategy_name << std::endl;
+
   std::ifstream optionsfile (optionsfilename);
 
   if (!optionsfile) {
@@ -2009,11 +2036,8 @@ poisson_boltzmann::create_markers (ray_cache_t & ray_cache)
 }
 
 
-/*
-CODICE VECCHIO OK
-
 void
-poisson_boltzmann::redistribute_border_quad ()
+poisson_boltzmann::redistribute_border_quad_embedded ()
 {
   int rank, size;
   MPI_Comm_rank (mpicomm, &rank);
@@ -2047,17 +2071,17 @@ poisson_boltzmann::redistribute_border_quad ()
   bq_local_target_count = base + (rank < rem ? 1 : 0);
 
   // Build the flattened distributed_vector: this rank asks to own
-  // BQ_PACKET_SIZE * bq_local_target_count doubles. distributed_vector's
+  // BQ_PACKET_SIZE_EMBEDDED * bq_local_target_count doubles. distributed_vector's
   // constructor takes care of turning this into a consistent global
   // numbering across all ranks (see bim_distributed_vector.cpp).
   border_quad_distributed =
-    std::make_unique<distributed_vector> (BQ_PACKET_SIZE * bq_local_target_count, mpicomm);
+    std::make_unique<distributed_vector> (BQ_PACKET_SIZE_EMBEDDED * bq_local_target_count, mpicomm);
 
   // Write every locally-buffered packet into its global slot.
   // "k" is this quadrant's position in the (source) global numbering.
   for (int i = 0; i < n_local; ++i) {
     const int k = local_offset + i;
-    const int base_idx = BQ_PACKET_SIZE * k;
+    const int base_idx = BQ_PACKET_SIZE_EMBEDDED * k;
 
     // phi was not available during create_markers: fetch it now,
     // using the global node indices saved back then.
@@ -2102,14 +2126,12 @@ poisson_boltzmann::redistribute_border_quad ()
   std::vector<std::array<double,36>> ().swap (bq_local_normals);
 }
 
-*/
 
-// VERSIONE NUOVA 
 // ============================================================================
 //  Strategia nuova: index-based redistribution
 // ============================================================================
 void
-poisson_boltzmann::redistribute_border_quad ()
+poisson_boltzmann::redistribute_border_quad_indexed ()
 {
   int rank, size;
   MPI_Comm_rank (mpicomm, &rank);
@@ -2143,11 +2165,11 @@ poisson_boltzmann::redistribute_border_quad ()
   bq_local_target_count = base + (rank < rem ? 1 : 0);
 
   // Build the flattened distributed_vector: this rank asks to own
-  // BQ_PACKET_SIZE * bq_local_target_count doubles. distributed_vector's
+  // BQ_PACKET_SIZE_INDEXED * bq_local_target_count doubles. distributed_vector's
   // constructor takes care of turning this into a consistent global
   // numbering across all ranks (see bim_distributed_vector.cpp).
   border_quad_distributed =
-    std::make_unique<distributed_vector> (BQ_PACKET_SIZE * bq_local_target_count, mpicomm);
+    std::make_unique<distributed_vector> (BQ_PACKET_SIZE_INDEXED * bq_local_target_count, mpicomm);
 
   // Write every locally-buffered packet into its global slot.
   // "k" is this quadrant's position in the (source) global numbering.
@@ -2157,7 +2179,7 @@ poisson_boltzmann::redistribute_border_quad ()
   // phi/eps themselves are fetched later, by index, further below.
   for (int i = 0; i < n_local; ++i) {
     const int k = local_offset + i;
-    const int base_idx = BQ_PACKET_SIZE * k;
+    const int base_idx = BQ_PACKET_SIZE_INDEXED * k;
 
     for (int inode = 0; inode < 8; ++inode)
       (*border_quad_distributed) (base_idx + inode) =
@@ -2230,7 +2252,7 @@ poisson_boltzmann::redistribute_border_quad ()
   // assemble() step afterwards could fix that.
   std::vector<double> &owned_bq = border_quad_distributed->get_owned_data ();
   for (int p = 0; p < bq_local_target_count; ++p) {
-    const int base_idx = BQ_PACKET_SIZE * p;
+    const int base_idx = BQ_PACKET_SIZE_INDEXED * p;
     for (int inode = 0; inode < 8; ++inode) {
       const int gnode = static_cast<int> (owned_bq[base_idx + inode]);
       if (gnode < phi_lo || gnode >= phi_hi) {
@@ -2252,7 +2274,7 @@ poisson_boltzmann::redistribute_border_quad ()
   bq_phi_owned.resize (8 * bq_local_target_count);
   bq_eps_owned.resize (8 * bq_local_target_count);
   for (int p = 0; p < bq_local_target_count; ++p) {
-    const int base_idx = BQ_PACKET_SIZE * p;
+    const int base_idx = BQ_PACKET_SIZE_INDEXED * p;
     for (int inode = 0; inode < 8; ++inode) {
       const int gnode = static_cast<int> (owned_bq[base_idx + inode]);
       bq_phi_owned[8*p + inode] = (*phi_req)[gnode];
@@ -2260,7 +2282,6 @@ poisson_boltzmann::redistribute_border_quad ()
     }
   }
 }
-
 
 
 void
@@ -3663,9 +3684,9 @@ poisson_boltzmann::energy (ray_cache_t & ray_cache)
   }
 }
 
-/*
+
 void
-poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
+poisson_boltzmann::energy_fast_unbalanced (ray_cache_t & ray_cache)
 {
   int rank;
   MPI_Comm_rank (mpicomm, &rank);
@@ -3725,7 +3746,6 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
 
     coul_energy *= den_in;
   }
-
 
   ////////////////////////////////////////////////////////
   ////////////////////////////////////////////////////////////////////////////
@@ -3953,14 +3973,10 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
     std::cout << "===========================================================\n";
   }
 }
-*/
 
-
-/*
-VERSIONE VECCHIA OK
 
 void
-poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
+poisson_boltzmann::energy_fast_embedded (ray_cache_t & ray_cache)
 {
   int rank;
   MPI_Comm_rank (mpicomm, &rank);
@@ -3968,7 +3984,7 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   // Diagnostic print: "as-found" count is how many border quadrants this
   // rank found during marking (the old, unbalanced number, still in
   // border_quad); "balanced packets" is how many packets this rank now
-  // owns after redistribute_border_quad() -- the number the loops below
+  // owns after redistribute_border_quad_embedded() -- the number the loops below
   // actually iterate on. Comparing the two, across ranks, is how we will
   // check that the redistribution really balances the workload.
   std::cout << "[Rank " << rank << "] border_quad size (as-found): "
@@ -4076,8 +4092,8 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   // This is the key structural change: instead of iterating on border_quad
   // and reaching into tmsh/phi/epsilon_nodes through a quadrant iterator,
   // we iterate on this rank's own slice of the balanced, flattened vector
-  // built earlier by redistribute_border_quad(). get_owned_data() returns
-  // a plain std::vector<double> of size BQ_PACKET_SIZE * bq_local_target_count.
+  // built earlier by redistribute_border_quad_embedded(). get_owned_data() returns
+  // a plain std::vector<double> of size BQ_PACKET_SIZE_EMBEDDED * bq_local_target_count.
   std::vector<double> &owned = border_quad_distributed->get_owned_data ();
 
   // ------------------------------------------------------------------
@@ -4090,7 +4106,7 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   if (bq_local_target_count > 0) {
     for (int d = 0; d < 3; ++d)
       h[d] = owned[40 + d];   // packet 0 starts at index 0, so its "h" slot
-                               // is simply at offset 40 (see BQ_PACKET_SIZE layout)
+                               // is simply at offset 40 (see BQ_PACKET_SIZE_EMBEDDED layout)
 
     area_h[0] = h[1]*h[2]/h[0] * 0.25;
     area_h[1] = h[0]*h[2]/h[1] * 0.25;
@@ -4105,7 +4121,7 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   // does not necessarily hold the data for a quadrant redistributed from
   // another rank). h/area_h are NOT reloaded here on purpose (see above).
   auto load_packet = [&] (int p) {
-    const int base_idx = BQ_PACKET_SIZE * p;
+    const int base_idx = BQ_PACKET_SIZE_EMBEDDED * p;
 
     for (int inode = 0; inode < 8; ++inode) {
       tmp_phi[inode] = owned[base_idx + inode];
@@ -4365,14 +4381,13 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   }
 }
 
-*/
 
 // ============================================================================
 //  Strategia nuova: energy_fast reading phi/eps from bq_phi_owned/
 //  bq_eps_owned (index-based fetch) instead of from the packet itself.
 // ============================================================================
 void
-poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
+poisson_boltzmann::energy_fast_indexed (ray_cache_t & ray_cache)
 {
   int rank;
   MPI_Comm_rank (mpicomm, &rank);
@@ -4380,7 +4395,7 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   // Diagnostic print: "as-found" count is how many border quadrants this
   // rank found during marking (the old, unbalanced number, still in
   // border_quad); "balanced packets" is how many packets this rank now
-  // owns after redistribute_border_quad() -- the number the loops below
+  // owns after redistribute_border_quad_indexed() -- the number the loops below
   // actually iterate on. Comparing the two, across ranks, is how we will
   // check that the redistribution really balances the workload.
   std::cout << "[Rank " << rank << "] border_quad size (as-found): "
@@ -4488,11 +4503,11 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   // This is the key structural change: instead of iterating on border_quad
   // and reaching into tmsh/phi/epsilon_nodes through a quadrant iterator,
   // we iterate on this rank's own slice of the balanced, flattened vector
-  // built earlier by redistribute_border_quad(). get_owned_data() returns
-  // a plain std::vector<double> of size BQ_PACKET_SIZE * bq_local_target_count.
+  // built earlier by redistribute_border_quad_indexed(). get_owned_data() returns
+  // a plain std::vector<double> of size BQ_PACKET_SIZE_INDEXED * bq_local_target_count.
   // Note: this vector no longer carries phi/eps (only gnodes, coords, h,
   // frac, normal -- 83 doubles/packet); phi/eps live in the separate
-  // bq_phi_owned/bq_eps_owned buffers, filled by redistribute_border_quad().
+  // bq_phi_owned/bq_eps_owned buffers, filled by redistribute_border_quad_indexed().
   std::vector<double> &owned = border_quad_distributed->get_owned_data ();
 
   // ------------------------------------------------------------------
@@ -4505,7 +4520,7 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   if (bq_local_target_count > 0) {
     for (int d = 0; d < 3; ++d)
       h[d] = owned[32 + d];   // packet 0 starts at index 0, so its "h" slot
-                              // is simply at offset 32 (see BQ_PACKET_SIZE layout)
+                              // is simply at offset 32 (see BQ_PACKET_SIZE_INDEXED layout)
 
     area_h[0] = h[1]*h[2]/h[0] * 0.25;
     area_h[1] = h[0]*h[2]/h[1] * 0.25;
@@ -4521,7 +4536,7 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   // another rank). h/area_h are NOT reloaded here on purpose (see above).
   //
   // phi/eps are read from bq_phi_owned/bq_eps_owned (filled by
-  // redistribute_border_quad() with an index-based fetch), indexed the
+  // redistribute_border_quad_indexed() with an index-based fetch), indexed the
   // same way (8*p + inode); coords/frac/normal still come straight from
   // the packet, at their offsets.
   auto load_packet = [&] (int p) {
@@ -4530,7 +4545,7 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
       tmp_eps[inode] = bq_eps_owned[8*p + inode];
     }
 
-    const int base_idx = BQ_PACKET_SIZE * p;
+    const int base_idx = BQ_PACKET_SIZE_INDEXED * p;
     for (int c = 0; c < 24; ++c)
       pkt_coords[c] = owned[base_idx + 8 + c];
     for (int e = 0; e < 12; ++e)

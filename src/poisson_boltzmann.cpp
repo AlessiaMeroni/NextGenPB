@@ -242,9 +242,18 @@ main (int argc, char **argv)
   if (! (pb.loc_refinement == 1
          || pb.mesh_shape > 2
          || (pb.mesh_shape == 2 && pb.refine_box == 1))){
-    TIC ();
-    pb.redistribute_border_quad ();
-    TOC ("Redistribute border quad")
+    // Only balanced strategies need a redistribution step; the unbalanced
+    // (original) strategy computes energy directly on each rank's own
+    // border_quad, with no redistribution at all.
+    if (pb.strategy == poisson_boltzmann::border_quad_strategy::balanced_embedded) {
+      TIC ();
+      pb.redistribute_border_quad_embedded ();
+      TOC ("Redistribute border quad")
+    } else if (pb.strategy == poisson_boltzmann::border_quad_strategy::balanced_indexed) {
+      TIC ();
+      pb.redistribute_border_quad_indexed ();
+      TOC ("Redistribute border quad")
+    }
   }
 
   if (pb.atoms_write == 1) {
@@ -255,12 +264,21 @@ main (int argc, char **argv)
 
   if (pb.calc_energy > 0) {
     TIC ();
-
     if (pb.loc_refinement == 1 || pb.mesh_shape > 2 || (pb.mesh_shape==2 && pb.refine_box==1))
       pb.energy (ray_cache);
-    else
-      pb.energy_fast (ray_cache);
-
+    else {
+      switch (pb.strategy) {
+        case poisson_boltzmann::border_quad_strategy::unbalanced:
+          pb.energy_fast_unbalanced (ray_cache);
+          break;
+        case poisson_boltzmann::border_quad_strategy::balanced_embedded:
+          pb.energy_fast_embedded (ray_cache);
+          break;
+        case poisson_boltzmann::border_quad_strategy::balanced_indexed:
+          pb.energy_fast_indexed (ray_cache);
+          break;
+      }
+    }
     TOC ("Compute energy")
   }
 

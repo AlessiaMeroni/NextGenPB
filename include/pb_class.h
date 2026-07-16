@@ -166,62 +166,13 @@ struct
 
   std::vector<int> border_quad;
 
-/*
-STRATEGIA VECCHIA OK
-
-  //  Balanced redistribution of border_quad
-  
-  // Packet layout (offsets relative to 91*k, k = global border-quadrant index):
-  //   [ 0 .. 7]  phi     (potential on the 8 nodes)
-  //   [ 8 ..15]  eps     (dielectric constant on the 8 nodes)
-  //   [16 ..39]  coords  (x,y,z of the 8 nodes, flattened)
-  //   [40 ..42]  h       (quadrant size along x,y,z)
-  //   [43 ..54]  frac    (surface-intersection fraction, one per cube edge, 12 edges)
-  //   [55 ..90]  normal  (surface normal, 3 components per edge, 12 edges)
-  // distributed_vector only stores doubles, so each border quadrant is
-  // "flattened" into BQ_PACKET_SIZE consecutive global indices. Since
-  // distributed_vector always assigns contiguous index blocks to ranks,
-  // an owned_count that is a multiple of BQ_PACKET_SIZE guarantees that a
-  // packet is never split between two ranks.
-  static constexpr int BQ_PACKET_SIZE = 91;  // 8+8+24+3+12+36
-
-  // Local staging buffers, filled inside create_markers() when a quadrant
-  // is classified as "border". coords/h/frac/normal are all available at
-  // marking time (frac/normal need ray_cache); phi and eps are not yet
-  // available/synchronized at this point (phi: linear system not solved
-  // yet; eps: epsilon_nodes is only ghost-synchronized later, when
-  // building the linear system) -> both are fetched later, in
-  // redistribute_border_quad(), using the node indices saved here.
-  std::vector<std::array<double,24>> bq_local_coords;
-  std::vector<std::array<double,3>>  bq_local_h;
-  std::vector<std::array<double,12>> bq_local_frac;     // one fraction per cube edge
-  std::vector<std::array<double,36>> bq_local_normals;  // one normal (3 comps) per cube edge
-  std::vector<std::array<int,8>>     bq_local_gnodes;   // global node indices (for eps/phi later)
-
-  // Balanced, flattened representation of all border-quadrant packets,
-  // built by redistribute_border_quad() after the linear system is solved.
-  std::unique_ptr<distributed_vector> border_quad_distributed;
-
-  // Number of packets (border quadrants) owned by this rank after the
-  // balanced redistribution (set inside redistribute_border_quad()).
-  int bq_local_target_count = 0;
-
-  // Build the balanced, flattened distributed_vector of border-quadrant packets.
-  // Must be called exactly once, after the linear system has been
-  // solved (phi available) and before energy_fast(). 
-  void redistribute_border_quad();
-
-*/
-
   // ============================================================================
-  //  Strategia vecchia: balanced redistribution of border_quad
+  //  Balanced redistribution of border_quad: shared staging buffers and
+  //  data structures used by both balanced strategies (balanced_embedded,
+  //  balanced_indexed -- see border_quad_strategy below). The unbalanced
+  //  strategy does not use any of this, it works directly on border_quad.
   //
-  //  The previous packet layout (91 values, phi+eps embedded) is kept below 
-  //  as a comment for quick rollback if the new strategy turns out to perform worse; 
-  //  the corresponding function bodies (redistribute_border_quad(), energy_fast()) will be
-  //  commented out the same way, in their own files, once we get there.
-  //
-  //  OLD packet layout (BQ_PACKET_SIZE = 91):
+  //  OLD packet layout (balanced_embedded, BQ_PACKET_SIZE_EMBEDDED = 91):
   //    [ 0 .. 7]  phi     (potential on the 8 nodes)
   //    [ 8 ..15]  eps     (dielectric constant on the 8 nodes)
   //    [16 ..39]  coords  (x,y,z of the 8 nodes, flattened)
@@ -229,7 +180,7 @@ STRATEGIA VECCHIA OK
   //    [43 ..54]  frac    (surface-intersection fraction, one per cube edge)
   //    [55 ..90]  normal  (surface normal, 3 components per edge)
   //
-  //  NEW packet layout (BQ_PACKET_SIZE = 83):
+  //  NEW packet layout (balanced_indexed, BQ_PACKET_SIZE_INDEXED = 83):
   //    [ 0 .. 7]  gnodes  (global node indices, 8 values -- replaces phi+eps)
   //    [ 8 ..31]  coords  (x,y,z of the 8 nodes, flattened)
   //    [32 ..34]  h       (quadrant size along x,y,z)
@@ -242,42 +193,74 @@ STRATEGIA VECCHIA OK
   //  an owned_count that is a multiple of BQ_PACKET_SIZE guarantees that a
   //  packet is never split between two ranks.
   // ============================================================================
-  static constexpr int BQ_PACKET_SIZE = 83;  // 8 gnodes + 24 coords + 3 h + 12 frac + 36 normal
 
   // Local staging buffers, filled inside create_markers() when a quadrant
   // is classified as "border". All are available at marking time
   // (frac/normal need ray_cache, valid only for this rank's own quadrant
-  // at this moment). phi and eps are not staged here any more: only the global 
-  // node indices are kept; phi/eps are fetched later BY INDEX, in redistribute_border_quad(), 
-  // via the new index-based remote-read block.
+  // at this moment). Used by both balanced strategies; balanced_embedded
+  // fetches phi/eps locally while building the packet, balanced_indexed
+  // stores only the node indices here and fetches phi/eps later, by index,
+  // in redistribute_border_quad_indexed().
   std::vector<std::array<double,24>> bq_local_coords;
   std::vector<std::array<double,3>>  bq_local_h;
   std::vector<std::array<double,12>> bq_local_frac;     // one fraction per cube edge
   std::vector<std::array<double,36>> bq_local_normals;  // one normal (3 comps) per cube edge
-  std::vector<std::array<int,8>>     bq_local_gnodes;   // global node indices (now part of the packet itself)
+  std::vector<std::array<int,8>>     bq_local_gnodes;   // global node indices
 
   // Balanced, flattened representation of all border-quadrant packets,
-  // built by redistribute_border_quad() after the linear system is solved.
+  // built by redistribute_border_quad_{embedded,indexed}() after the
+  // linear system is solved.
   std::unique_ptr<distributed_vector> border_quad_distributed;
 
   // Number of packets (border quadrants) owned by this rank after the
-  // balanced redistribution (set inside redistribute_border_quad()).
+  // balanced redistribution (set inside redistribute_border_quad_{embedded,indexed}()).
   int bq_local_target_count = 0;
 
   // Per-packet phi/eps values, fetched by global node index AFTER
-  // border_quad_distributed->assemble() (Strategia C-bis, Part 3).
+  // border_quad_distributed->assemble(). Used only by balanced_indexed.
   // Layout: bq_phi_owned[8*p + inode] is phi at packet p's inode-th node
-  // (same indexing convention used by tmp_phi/tmp_eps in energy_fast).
+  // (same indexing convention used by tmp_phi/tmp_eps in energy_fast_indexed).
   std::vector<double> bq_phi_owned;
   std::vector<double> bq_eps_owned;
 
-  // Build the balanced, flattened distributed_vector of border-quadrant
-  // packets, then fetch phi/eps by global node index for each owned packet.
-  // Must be called exactly once, after the linear system has been
-  // solved (phi available) and before energy_fast().
-  void redistribute_border_quad();
+  // ============================================================================
+  //  Strategy selection for border_quad handling, selectable at runtime via
+  //  --strategy on the command line (see parse_options()). Lets the user
+  //  reproduce and compare all three implementations from a single build,
+  //  without touching source files or recompiling.
+  //    unbalanced        : original strategy, no redistribution at all,
+  //                         each rank computes energy only on the border
+  //                         quadrants it happened to find during marking.
+  //    balanced_embedded : balanced redistribution with phi/eps VALUES
+  //                         embedded directly in each packet (91 doubles).
+  //    balanced_indexed  : balanced redistribution with only 8 global node
+  //                         INDICES in each packet (83 doubles); phi/eps
+  //                         fetched separately, by index, after redistribution.
+  // ============================================================================
+  enum class border_quad_strategy { unbalanced, balanced_embedded, balanced_indexed };
 
+  // Selected strategy, set in parse_options(); defaults to the current,
+  // most optimized implementation if --strategy is not given.
+  border_quad_strategy strategy = border_quad_strategy::balanced_indexed;
 
+  // Packet size differs between the two redistribution strategies (91 vs
+  // 83 doubles/packet -- see report.tex, Sec. "Strategia C" and "Progettazione
+  // dell'Alternativa a Indice"). The unbalanced strategy does not redistribute
+  // packets at all, so it needs neither constant.
+  static constexpr int BQ_PACKET_SIZE_EMBEDDED = 91;
+  static constexpr int BQ_PACKET_SIZE_INDEXED  = 83;
+
+  // One redistribute_border_quad() per strategy that needs it (the unbalanced
+  // strategy computes everything locally, quadrant by quadrant, with no
+  // redistribution step).
+  void redistribute_border_quad_embedded ();
+  void redistribute_border_quad_indexed ();
+
+  // One energy_fast() per strategy, selected at the call site in
+  // poisson_boltzmann.cpp based on `strategy`.
+  void energy_fast_unbalanced (ray_cache_t & ray_cache);
+  void energy_fast_embedded (ray_cache_t & ray_cache);
+  void energy_fast_indexed (ray_cache_t & ray_cache);
 
 
   std::set<std::array<int, 2>> int_nodes;
