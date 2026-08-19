@@ -253,6 +253,7 @@ struct
   // One redistribute_border_quad() per strategy that needs it (the unbalanced
   // strategy computes everything locally, quadrant by quadrant, with no
   // redistribution step).
+  template <typename Policy> void redistribute_border_quad ();
   void redistribute_border_quad_embedded ();
   void redistribute_border_quad_indexed ();
 
@@ -261,6 +262,8 @@ struct
   void energy_fast_unbalanced (ray_cache_t & ray_cache);
   void energy_fast_embedded (ray_cache_t & ray_cache);
   void energy_fast_indexed (ray_cache_t & ray_cache);
+
+  template <typename Policy> void energy_fast (ray_cache_t & ray_cache);
 
 
   std::set<std::array<int, 2>> int_nodes;
