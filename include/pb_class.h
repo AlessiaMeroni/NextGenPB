@@ -166,106 +166,106 @@ struct
 
   std::vector<int> border_quad;
 
-  // ============================================================================
-  //  Balanced redistribution of border_quad: shared staging buffers and
-  //  data structures used by both balanced strategies (balanced_embedded,
-  //  balanced_indexed -- see border_quad_strategy below). The unbalanced
-  //  strategy does not use any of this, it works directly on border_quad.
-  //
-  //  OLD packet layout (balanced_embedded, BQ_PACKET_SIZE_EMBEDDED = 91):
-  //    [ 0 .. 7]  phi     (potential on the 8 nodes)
-  //    [ 8 ..15]  eps     (dielectric constant on the 8 nodes)
-  //    [16 ..39]  coords  (x,y,z of the 8 nodes, flattened)
-  //    [40 ..42]  h       (quadrant size along x,y,z)
-  //    [43 ..54]  frac    (surface-intersection fraction, one per cube edge)
-  //    [55 ..90]  normal  (surface normal, 3 components per edge)
-  //
-  //  NEW packet layout (balanced_indexed, BQ_PACKET_SIZE_INDEXED = 83):
-  //    [ 0 .. 7]  gnodes  (global node indices, 8 values -- replaces phi+eps)
-  //    [ 8 ..31]  coords  (x,y,z of the 8 nodes, flattened)
-  //    [32 ..34]  h       (quadrant size along x,y,z)
-  //    [35 ..46]  frac    (surface-intersection fraction, one per cube edge)
-  //    [47 ..82]  normal  (surface normal, 3 components per edge)
-  //
-  //  distributed_vector only stores doubles, so each border quadrant is
-  //  "flattened" into BQ_PACKET_SIZE consecutive global indices. Since
-  //  distributed_vector always assigns contiguous index blocks to ranks,
-  //  an owned_count that is a multiple of BQ_PACKET_SIZE guarantees that a
-  //  packet is never split between two ranks.
-  // ============================================================================
+  /**
+   * @brief Balanced redistribution of border_quad: shared staging buffers
+   *        and data structures used by both balanced strategies
+   *        (balanced_embedded, balanced_indexed). The unbalanced strategy does
+   *        not use any of this: it works directly on border_quad.
+   *
+   * Packet layout for balanced_embedded (EmbeddedPacketPolicy::PACKET_SIZE = 91):
+   *   [ 0 .. 7]  phi     (potential on the 8 nodes)
+   *   [ 8 ..15]  eps     (dielectric constant on the 8 nodes)
+   *   [16 ..39]  coords  (x,y,z of the 8 nodes, flattened)
+   *   [40 ..42]  h       (quadrant size along x,y,z)
+   *   [43 ..54]  frac    (surface-intersection fraction, one per cube edge)
+   *   [55 ..90]  normal  (surface normal, 3 components per edge)
+   *
+   * Packet layout for balanced_indexed (IndexedPacketPolicy::PACKET_SIZE = 83):
+   *   [ 0 .. 7]  gnodes  (global node indices, 8 values -- replaces phi+eps)
+   *   [ 8 ..31]  coords  (x,y,z of the 8 nodes, flattened)
+   *   [32 ..34]  h       (quadrant size along x,y,z)
+   *   [35 ..46]  frac    (surface-intersection fraction, one per cube edge)
+   *   [47 ..82]  normal  (surface normal, 3 components per edge)
+   *
+   * distributed_vector only stores doubles, so each border quadrant is
+   * "flattened" into PACKET_SIZE consecutive global indices. Since
+   * distributed_vector always assigns contiguous index blocks to ranks, an
+   * owned_count that is a multiple of PACKET_SIZE guarantees that a packet
+   * is never split between two ranks.
+   */
 
-  // Local staging buffers, filled inside create_markers() when a quadrant
-  // is classified as "border". All are available at marking time
-  // (frac/normal need ray_cache, valid only for this rank's own quadrant
-  // at this moment). Used by both balanced strategies; balanced_embedded
-  // fetches phi/eps locally while building the packet, balanced_indexed
-  // stores only the node indices here and fetches phi/eps later, by index,
-  // in redistribute_border_quad_indexed().
+  /// Local staging buffers, filled inside create_markers() when a quadrant
+  /// is classified as "border". All are available at marking time
+  /// (frac/normal need ray_cache, valid only for this rank's own quadrant
+  /// at this moment). Used by both balanced strategies; balanced_embedded
+  /// fetches phi/eps locally while building the packet (EmbeddedPacketPolicy::
+  /// write_prefix), balanced_indexed stores only the node indices here and
+  /// fetches phi/eps later, by index, in IndexedPacketPolicy::post_process().
   std::vector<std::array<double,24>> bq_local_coords;
   std::vector<std::array<double,3>>  bq_local_h;
-  std::vector<std::array<double,12>> bq_local_frac;     // one fraction per cube edge
-  std::vector<std::array<double,36>> bq_local_normals;  // one normal (3 comps) per cube edge
-  std::vector<std::array<int,8>>     bq_local_gnodes;   // global node indices
-
-  // Balanced, flattened representation of all border-quadrant packets,
-  // built by redistribute_border_quad_{embedded,indexed}() after the
-  // linear system is solved.
+  std::vector<std::array<double,12>> bq_local_frac;     ///< one fraction per cube edge
+  std::vector<std::array<double,36>> bq_local_normals;  ///< one normal (3 comps) per cube edge
+  std::vector<std::array<int,8>>     bq_local_gnodes;   ///< global node indices
+  
+  /// Balanced, flattened representation of all border-quadrant packets,
+  /// built by the shared redistribute_border_quad<Policy>() template,
+  /// invoked through redistribute_border_quad_embedded()/_indexed(), after
+  /// the linear system is solved.
   std::unique_ptr<distributed_vector> border_quad_distributed;
-
-  // Number of packets (border quadrants) owned by this rank after the
-  // balanced redistribution (set inside redistribute_border_quad_{embedded,indexed}()).
+  
+  /// Number of packets (border quadrants) owned by this rank after the
+  /// balanced redistribution (set inside redistribute_border_quad<Policy>()).
   int bq_local_target_count = 0;
-
-  // Per-packet phi/eps values, fetched by global node index AFTER
-  // border_quad_distributed->assemble(). Used only by balanced_indexed.
-  // Layout: bq_phi_owned[8*p + inode] is phi at packet p's inode-th node
-  // (same indexing convention used by tmp_phi/tmp_eps in energy_fast_indexed).
+  
+  /// Per-packet phi/eps values, fetched by global node index inside
+  /// IndexedPacketPolicy::post_process(), after border_quad_distributed->
+  /// assemble(). Used only by balanced_indexed.
   std::vector<double> bq_phi_owned;
   std::vector<double> bq_eps_owned;
-
-  // ============================================================================
-  //  Strategy selection for border_quad handling, selectable at runtime via
-  //  --strategy on the command line (see parse_options()). Lets the user
-  //  reproduce and compare all three implementations from a single build,
-  //  without touching source files or recompiling.
-  //    unbalanced        : original strategy, no redistribution at all,
-  //                         each rank computes energy only on the border
-  //                         quadrants it happened to find during marking.
-  //    balanced_embedded : balanced redistribution with phi/eps VALUES
-  //                         embedded directly in each packet (91 doubles).
-  //    balanced_indexed  : balanced redistribution with only 8 global node
-  //                         INDICES in each packet (83 doubles); phi/eps
-  //                         fetched separately, by index, after redistribution.
-  // ============================================================================
+  
+  /// @brief Strategy selection for border_quad handling, selectable at
+  ///        runtime via --strategy on the command line (see
+  ///        parse_options()). Lets the user reproduce and compare all
+  ///        three implementations from a single build, without touching
+  ///        source files or recompiling.
+  ///
+  /// - unbalanced: original strategy, no redistribution at all, each rank
+  ///   computes energy only on the border quadrants it happened to find
+  ///   during marking.
+  /// - balanced_embedded: balanced redistribution with phi/eps VALUES
+  ///   embedded directly in each packet (91 doubles).
+  /// - balanced_indexed: balanced redistribution with only 8 global node
+  ///   INDICES in each packet (83 doubles); phi/eps fetched separately, by
+  ///   index, after redistribution.
   enum class border_quad_strategy { unbalanced, balanced_embedded, balanced_indexed };
-
-  // Selected strategy, set in parse_options(); defaults to the current,
-  // most optimized implementation if --strategy is not given.
+  
+  /// Selected strategy, set in parse_options(); defaults to the current,
+  /// most optimized implementation if --strategy is not given.
   border_quad_strategy strategy = border_quad_strategy::balanced_indexed;
-
-  // Packet size differs between the two redistribution strategies (91 vs
-  // 83 doubles/packet -- see report.tex, Sec. "Strategia C" and "Progettazione
-  // dell'Alternativa a Indice"). The unbalanced strategy does not redistribute
-  // packets at all, so it needs neither constant.
-  static constexpr int BQ_PACKET_SIZE_EMBEDDED = 91;
-  static constexpr int BQ_PACKET_SIZE_INDEXED  = 83;
-
-  // One redistribute_border_quad() per strategy that needs it (the unbalanced
-  // strategy computes everything locally, quadrant by quadrant, with no
-  // redistribution step).
+  
+  /// @brief A single shared template, redistribute_border_quad<Policy>(),
+  ///        performs the redistribution for both balanced strategies; the
+  ///        two thin bridges below select EmbeddedPacketPolicy/
+  ///        IndexedPacketPolicy at compile time. The unbalanced strategy
+  ///        needs neither: it computes everything locally, quadrant by
+  ///        quadrant, with no redistribution step.
   template <typename Policy> void redistribute_border_quad ();
   void redistribute_border_quad_embedded ();
   void redistribute_border_quad_indexed ();
-
-  // One energy_fast() per strategy, selected at the call site in
-  // poisson_boltzmann.cpp based on `strategy`.
+  
+  /// @brief Likewise, a single shared template, energy_fast<Policy>(),
+  ///        computes the electrostatic energy for both balanced strategies;
+  ///        the two thin bridges below select the policy. A third, separate
+  ///        function, energy_fast_unbalanced(), handles the unbalanced
+  ///        strategy directly (never templated, since it has no policy to
+  ///        vary). The call site in poisson_boltzmann.cpp selects among the
+  ///        three based on `strategy`.
   void energy_fast_unbalanced (ray_cache_t & ray_cache);
   void energy_fast_embedded (ray_cache_t & ray_cache);
   void energy_fast_indexed (ray_cache_t & ray_cache);
-
+  
   template <typename Policy> void energy_fast (ray_cache_t & ray_cache);
-
-
+  
   std::set<std::array<int, 2>> int_nodes;
 
   std::unique_ptr<distributed_vector> markn;

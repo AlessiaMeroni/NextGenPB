@@ -237,14 +237,18 @@ main (int argc, char **argv)
 
   TOC ("Compute numerical solution");
 
-  // Build the balanced border-quadrant data now that phi is available. 
-  // Only needed when energy_fast() is about to run.
+  /// @brief Redistributes border-quadrant packets, but only for the two
+  ///        balanced strategies, and only when a "fast" energy variant
+  ///        will actually consume them afterward.
+  ///
+  /// Build the balanced border-quadrant data now that phi is available. 
+  /// Only needed when energy_fast() is about to run.
   if (! (pb.loc_refinement == 1
          || pb.mesh_shape > 2
          || (pb.mesh_shape == 2 && pb.refine_box == 1))){
-    // Only balanced strategies need a redistribution step; the unbalanced
-    // (original) strategy computes energy directly on each rank's own
-    // border_quad, with no redistribution at all.
+    /// Only balanced strategies need a redistribution step; the unbalanced
+    /// (original) strategy computes energy directly on each rank's own
+    /// border_quad, with no redistribution at all.
     if (pb.strategy == poisson_boltzmann::border_quad_strategy::balanced_embedded) {
       TIC ();
       pb.redistribute_border_quad_embedded ();
@@ -256,12 +260,18 @@ main (int argc, char **argv)
     }
   }
 
+  /// @brief Writes the potential evaluated at every atom's position to file,
+  ///        if requested. Unrelated to the strategy selection: runs
+  ///        identically regardless of which border_quad strategy is active.
   if (pb.atoms_write == 1) {
     TIC ();
     pb.write_potential_on_atoms_fast ();
     TOC ("Write potential on atoms")
   }
 
+  /// @brief Dispatches the actual electrostatic energy computation.
+  /// @note Unlike the redistribution if/else-if above, every case of
+  ///       border_quad_strategy is handled here explicitly.
   if (pb.calc_energy > 0) {
     TIC ();
     if (pb.loc_refinement == 1 || pb.mesh_shape > 2 || (pb.mesh_shape==2 && pb.refine_box==1))
