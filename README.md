@@ -31,6 +31,8 @@ Comprehensive installation instructions, examples, and usage guides are availabl
 
 [NextGenPB Tutorial and Guide](https://vdiflorio.github.io/nextgenpb_tutorial/)
 
+For this branch (`mesh-repartitioning`) specifically — the new load-balancing strategy for the surface-energy computation, the `--strategy` option, and full build and testing instructions for both a laptop and an HPC cluster — see [INSTALL.md](INSTALL.md).
+
 ---
 
 # Citation
