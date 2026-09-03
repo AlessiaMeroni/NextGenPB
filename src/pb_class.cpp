@@ -4047,7 +4047,7 @@ poisson_boltzmann::energy_fast (ray_cache_t & ray_cache)
   MPI_Comm_rank (mpicomm, &rank);
 
   /// @note Diagnostic print, added for the load-imbalance profiling of
-  ///       Chapter 4: "as-found" is how many border quadrants this rank
+  ///       Chapter 3: "as-found" is how many border quadrants this rank
   ///       found during marking (the old, unbalanced count, still in
   ///       border_quad); "balanced packets" is how many packets this
   ///       rank now owns after redistribute_border_quad<Policy>() (the
